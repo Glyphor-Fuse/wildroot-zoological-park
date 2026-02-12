@@ -1,0 +1,209 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Auto-cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build:
+    # Skip CI for template bootstrap commits (first commit when repo is cloned from template)
+    if: ${{ !contains(github.event.head_commit.message, '[initial-seed]') && !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  copilot-review:
+    # Request Copilot code review on PRs (skip template commits)
+    if: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.title, '[initial-seed]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request Copilot Review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                reviewers: ['copilot-pull-request-reviewer[bot]']
+              });
+              console.log('Copilot review requested');
+            } catch (e) {
+              // Copilot review may not be available on all repos
+              console.log('Could not request Copilot review:', e.message);
+            }
+
+  auto-merge:
+    # Auto-merge PRs created by Glyphor AI after CI passes
+    needs: [build]
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+            const headRef = context.payload.pull_request.head.ref;
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            const repoInfo = await github.rest.repos.get({ owner, repo });
+            const allowedMethods = [];
+            if (repoInfo.data.allow_merge_commit) allowedMethods.push('merge');
+            if (repoInfo.data.allow_squash_merge) allowedMethods.push('squash');
+            if (repoInfo.data.allow_rebase_merge) allowedMethods.push('rebase');
+
+            if (allowedMethods.length === 0) {
+              throw new Error('No merge methods enabled on repository settings');
+            }
+
+            console.log(`Allowed merge methods: ${allowedMethods.join(', ')}`);
+
+            let merged = false;
+            let lastError = '';
+
+            // Retry for a few minutes so external required checks (e.g. Vercel) can finish.
+            for (let attempt = 1; attempt <= 15 && !merged; attempt++) {
+              const pr = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: prNumber,
+              });
+
+              if (pr.data.merged || pr.data.state === 'closed') {
+                console.log(`PR #${prNumber} already merged/closed`);
+                merged = true;
+                break;
+              }
+
+              for (const method of allowedMethods) {
+                try {
+                  await github.rest.pulls.merge({
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    merge_method: method,
+                  });
+                  console.log(`PR #${prNumber} merged using ${method} (attempt ${attempt})`);
+                  merged = true;
+                  break;
+                } catch (err) {
+                  const msg = err?.message || String(err);
+                  lastError = `[${method}] ${msg}`;
+                  console.log(`Attempt ${attempt} merge via ${method} failed: ${msg}`);
+                }
+              }
+
+              if (!merged && attempt < 15) {
+                await sleep(20_000);
+              }
+            }
+
+            if (!merged) {
+              throw new Error(`Auto-merge failed after retries: ${lastError || 'unknown error'}`);
+            }
+
+            // Delete branch after successful merge (non-fatal if it fails)
+            try {
+              await github.rest.git.deleteRef({
+                owner,
+                repo,
+                ref: `heads/${headRef}`,
+              });
+              console.log(`Branch ${headRef} deleted`);
+            } catch (delErr) {
+              console.log('Branch deletion failed (non-fatal):', delErr.message);
+            }
+
+  retag-copilot-on-build-failure:
+    # If CI build fails on a PR, re-request Copilot and tag @copilot with context.
+    needs: [build, copilot-review]
+    if: ${{ always() && github.event_name == 'pull_request' && needs.build.result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-request Copilot and post failure context
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+            const headSha = context.payload.pull_request.head.sha;
+            const marker = `<!-- copilot-retag:${headSha} -->`;
+
+            // Avoid duplicate bot comments for the same head SHA.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const alreadyTagged = comments.some((c) =>
+              c?.user?.type === "Bot" &&
+              c?.body?.includes(marker)
+            );
+
+            // Try to request Copilot reviewer again (best effort).
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner,
+                repo,
+                pull_number: prNumber,
+                reviewers: ['copilot-pull-request-reviewer[bot]']
+              });
+              core.info('Re-requested Copilot reviewer');
+            } catch (e) {
+              core.info(`Could not re-request Copilot reviewer: ${e.message}`);
+            }
+
+            if (alreadyTagged) {
+              core.info(`Retag comment already exists for ${headSha}; skipping new comment.`);
+              return;
+            }
+
+            const runUrl = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = `${marker}
+            @copilot CI build failed on this PR. Please retry your review with focus on the failing checks and propose concrete fixes.
+            
+            - Failed workflow run: ${runUrl}
+            - Commit: \`${headSha}\`
+            - Triggered by: \`retag-copilot-on-build-failure\``;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: prNumber,
+              body
+            });
+            core.info('Posted @copilot retag comment');
